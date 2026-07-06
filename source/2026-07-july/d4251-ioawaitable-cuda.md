@@ -1,7 +1,7 @@
 ---
 title: "IoAwaitables for GPU Data Movement: Convergent Findings"
 document: P4251R0
-date: 2026-07-01
+date: 2026-07-06
 intent: info
 audience: SG1, LEWG
 reply-to:
@@ -182,16 +182,18 @@ deferred_sync_awaitable::await_suspend(
 }
 ```
 
-The remainder of this paper uses the callback mechanism as the running example because it is the simplest to present; the polling and deferred-synchronization awaitables appear in full in the accompanying example.<sup>[54]</sup>
+The remainder of this paper uses event polling as the running example, following CERN's traccc port<sup>[34]</sup> and the CHEP 2026 scaling measurement<sup>[55]</sup>. `cudaLaunchHostFunc` remains the simplest wiring in isolation, but it does not scale as worker-thread counts grow, and a paper whose central claim is that data movement matches a reactor-style completion model is better served by the reactor-shaped mechanism. The callback and deferred-synchronization awaitables appear in full in the accompanying example.<sup>[54]</sup>
 
 ## 6. Hand-Rolled Awaitables
 
-The simplest integration writes a minimal awaitable that resumes the coroutine from the CUDA callback:
+The simplest integration writes a minimal awaitable that resumes the coroutine when a CUDA event completes. The `poll_service` is a dedicated thread that loops `cudaEventQuery` over a registered set of pending waits; when an event reports ready, the service resumes the stored handle:
 
 ```cpp
 struct cuda_stream_awaiter
 {
     cudaStream_t stream;
+    cudaEvent_t  event;
+    poll_service& svc;
 
     bool await_ready() const noexcept
     {
@@ -200,54 +202,35 @@ struct cuda_stream_awaiter
 
     void await_suspend(std::coroutine_handle<> h)
     {
-        cudaLaunchHostFunc(stream,
-            [](void* data) {
-                std::coroutine_handle<>
-                    ::from_address(data)
-                    .resume();
-            },
-            h.address());
+        cudaEventRecord(event, stream);
+        svc.register_resume(event, h);
     }
 
     void await_resume() noexcept {}
 };
 ```
 
-This works. But `resume()` executes on the CUDA driver callback thread. There is no executor affinity, no cancellation support, and no frame allocation control. The coroutine's continuation runs on whatever thread the CUDA driver chose, which may not be safe for application logic that touches shared state.
+This works. But `resume()` executes on the polling service thread. There is no executor affinity, no cancellation support, and no frame allocation control. The coroutine's continuation runs on whatever thread the service chose, which may not be safe for application logic that touches shared state. The mechanism problem is different from the callback version (no driver-owned worker, no `cudaLaunchHostFunc` constraints) but the thread-affinity problem is identical: a minimal awaitable resumes wherever the notification fires.
 
 ## 7. `cuda_stream`: Data Movement as IoAwaitables
 
-The `cuda_stream` class wraps a CUDA stream handle and provides data-movement member functions that return IoAwaitables. The class follows the Rule of Five (copy deleted, move implemented, null-guarded destructor). The helper function `make_cuda_error`, defined by the accompanying demonstration<sup>[54]</sup> rather than by Capy, converts a `cudaError_t` to `std::error_code` via a CUDA error category.
+The `cuda_stream` class wraps a CUDA stream handle, a CUDA event, and a reference to a shared `poll_service`, and provides data-movement member functions that return IoAwaitables. The class follows the Rule of Five (copy deleted, move implemented, null-guarded destructor). The helper function `make_cuda_error`, defined by the accompanying demonstration<sup>[54]</sup> rather than by Capy, converts a `cudaError_t` to `std::error_code` via a CUDA error category.
 
-The key mechanism is `resume_ctx`: a pre-allocated member that captures the executor and continuation for `cudaLaunchHostFunc`. The `on_complete` callback posts the continuation back to the application's executor, providing the executor-affinity dispatch that the hand-rolled awaitable in Section 6 lacks.
+The key mechanism is `cudaEventRecord`: each operation enqueues the memcpy on the stream, records an event at the current stream position, and registers the event with the `poll_service`. When the polling thread observes the event ready, it posts the coroutine's continuation back to the application's executor, providing the executor-affinity dispatch that the hand-rolled awaitable in Section 6 lacks.
 
 ```cpp
 class cuda_stream
 {
     cudaStream_t stream_ = nullptr;
+    cudaEvent_t event_ = nullptr;
+    poll_service* svc_ = nullptr;
     continuation cont_;
     std::error_code error_;
-
-    struct resume_ctx
-    {
-        executor_ref ex;
-        continuation* cont;
-    };
-
-    resume_ctx ctx_;
-
-    static void CUDART_CB
-    on_complete(void* arg)
-    {
-        auto* ctx =
-            static_cast<resume_ctx*>(arg);
-        ctx->ex.post(*ctx->cont);
-    }
 
 public:
     // Rule of Five: create, destroy, move.
     // Copy is deleted.
-    cuda_stream();
+    explicit cuda_stream(poll_service& svc);
     ~cuda_stream();
     cuda_stream(cuda_stream&&) noexcept;
     cuda_stream& operator=(
@@ -294,20 +277,22 @@ public:
                         make_cuda_error(err);
                     return h;
                 }
-                self->cont_.h = h;
-                self->ctx_ = resume_ctx{
-                    env->executor,
-                    &self->cont_};
-                err = cudaLaunchHostFunc(
-                    self->stream_,
-                    &on_complete,
-                    &self->ctx_);
+                err = cudaEventRecord(
+                    self->event_,
+                    self->stream_);
                 if (err != cudaSuccess)
                 {
                     self->error_ =
                         make_cuda_error(err);
                     return h;
                 }
+                self->cont_.h = h;
+                self->svc_->register_wait(
+                    poll_entry{
+                        self->event_,
+                        env->executor,
+                        &self->cont_,
+                        &self->error_});
                 return std::noop_coroutine();
             }
 
@@ -329,15 +314,17 @@ public:
         // same pattern, cudaMemcpyDeviceToHost
 
     auto synchronize();
-        // cudaLaunchHostFunc only (no preceding op)
+        // record event, no preceding memcpy
 };
 ```
 
-The `resume_ctx` is a pre-allocated member of `cuda_stream`, not heap-allocated per operation. This is safe because the coroutine suspends on each `co_await`, so only one operation is in-flight per `cuda_stream` at a time. The CUDA Programming Guide<sup>[6]</sup> confirms that operations in a stream execute in enqueue order, and the CUDA Runtime API documentation<sup>[9]</sup> states that `cudaLaunchHostFunc` callbacks block later work in the stream until they return.<sup>[47]</sup> The pre-allocated `resume_ctx` is never accessed concurrently. This is the same one-at-a-time invariant that Capy's sockets rely on for their pre-allocated op states in the networking domain.
+The `continuation` and `error_code` are pre-allocated members of `cuda_stream`, not heap-allocated per operation. This is safe because the coroutine suspends on each `co_await`, so only one operation is in-flight per `cuda_stream` at a time. The CUDA Programming Guide<sup>[6]</sup> confirms that operations in a stream execute in enqueue order, so the recorded event fires only after the preceding memcpy completes. The pre-allocated members are never accessed concurrently. This is the same one-at-a-time invariant that Corosio's sockets<sup>[2]</sup> rely on for their pre-allocated op states in the networking domain.
 
-`cudaLaunchHostFunc` has documented constraints that production code must respect. The callback must not call CUDA APIs or synchronize on outstanding CUDA work.<sup>[9]</sup> A single CUDA-internal worker thread may service all callbacks across all streams; on loaded systems, OS scheduling can starve this thread, producing latency spikes up to 12ms between callback completion and stream resumption.<sup>[48]</sup> If the callback blocks on a user lock while the CUDA launch queue is full, the enqueuing thread blocks too, producing deadlock.<sup>[49]</sup> Notification is unidirectional: `cudaLaunchHostFunc` provides stream-to-CPU notification only and cannot make the stream wait for a CPU-side signal.<sup>[50]</sup> These constraints apply equally to any pattern that uses `cudaLaunchHostFunc` for completion notification, including the hand-rolled awaitable in Section 6 and any sender-based wrapper that uses the same mechanism. They do not invalidate the pattern but they bound its applicability in high-throughput pipelines. They are specific to the callback mechanism: the polling and deferred-synchronization awaitables of Section 5 sidestep all four. A CHEP 2026 scaling measurement<sup>[55]</sup> favors those alternatives as the worker-thread count grows, and CERN's traccc port<sup>[34]</sup> implements all three strategies over this one protocol so the mechanism can be selected per deployment. The IoAwaitable protocol is the same in every case; only the notification source changes.
+Polling has its own tradeoffs. The `poll_service` is a dedicated thread that spins over `cudaEventQuery`, so the pattern trades a parked worker (deferred synchronization) or a driver-scheduled callback thread (`cudaLaunchHostFunc`) for one continuously running service thread shared across all streams. Event recording costs an additional CUDA API call per operation beyond the memcpy itself, and reaching event readiness requires the stream to make forward progress; on a stalled stream a recorded event may never fire, so a production `poll_service` should honor `env->stop_token` and unregister waiters on cancellation (the demo awaitables in Section 5 omit this for brevity). In exchange, the CUDA-internal callback worker is not on the critical path, none of the `cudaLaunchHostFunc` constraints apply, and the pattern scales cleanly as worker-thread counts grow. The CHEP 2026 measurement<sup>[55]</sup> finds polling and deferred synchronization stable where the callback degrades; CERN's traccc port<sup>[34]</sup> implements all three strategies over this one protocol so the mechanism can be selected per deployment. The IoAwaitable protocol is the same in every case; only the notification source changes.
 
-One caveat: `cudaMemcpyAsync` is only truly asynchronous with pinned (page-locked) memory.<sup>[19]</sup> With pageable memory allocated via `malloc` or `new`, the call blocks the host thread despite the `Async` suffix.<sup>[20]</sup> For multi-gigabyte model weight transfers, this distinction matters.
+`cudaLaunchHostFunc` is worth naming here because it is the mechanism the existing GPU-coroutine landscape reaches for by default, and because the constraints it imposes are the practical reason to prefer polling. The callback must not call CUDA APIs or synchronize on outstanding CUDA work.<sup>[9]</sup> A single CUDA-internal worker thread may service all callbacks across all streams; on loaded systems, OS scheduling can starve this thread, producing latency spikes up to 12ms between callback completion and stream resumption.<sup>[48]</sup> If the callback blocks on a user lock while the CUDA launch queue is full, the enqueuing thread blocks too, producing deadlock.<sup>[49]</sup> Notification is unidirectional: `cudaLaunchHostFunc` provides stream-to-CPU notification only and cannot make the stream wait for a CPU-side signal.<sup>[50]</sup> These are specific to the callback mechanism; polling sidesteps all four.
+
+One caveat that is not specific to any notification mechanism: `cudaMemcpyAsync` is only truly asynchronous with pinned (page-locked) memory.<sup>[19]</sup> With pageable memory allocated via `malloc` or `new`, the call blocks the host thread despite the `Async` suffix.<sup>[20]</sup> For multi-gigabyte model weight transfers, this distinction matters.
 
 ### NCCL interop
 
@@ -351,7 +338,7 @@ ncclAllReduce(
 co_await cs.synchronize();
 ```
 
-When using grouped NCCL calls, `cudaLaunchHostFunc` must be enqueued after `ncclGroupEnd()` returns. For standalone calls, `co_await cs.synchronize()` immediately after the collective is correct.
+For grouped NCCL calls, `synchronize()` must be invoked after `ncclGroupEnd()` returns so the event records at the correct queue position. For standalone calls, `co_await cs.synchronize()` immediately after the collective is correct.
 
 ## 8. `cuda_device_stream`: GPU Memory as a WriteStream
 
@@ -361,32 +348,22 @@ The `cuda_device_stream` class reshapes the memcpy pattern to satisfy the `Write
 class cuda_device_stream
 {
     cudaStream_t stream_;
+    cudaEvent_t event_;
+    poll_service* svc_;
     std::byte* d_ptr_;
     std::size_t offset_ = 0;
     continuation cont_;
     std::error_code error_;
 
-    struct resume_ctx
-    {
-        executor_ref ex;
-        continuation* cont;
-    };
-
-    resume_ctx ctx_;
-
-    static void CUDART_CB
-    on_complete(void* arg)
-    {
-        auto* ctx =
-            static_cast<resume_ctx*>(arg);
-        ctx->ex.post(*ctx->cont);
-    }
-
 public:
     cuda_device_stream(
         cudaStream_t s,
+        cudaEvent_t e,
+        poll_service& svc,
         std::byte* device_ptr)
         : stream_(s)
+        , event_(e)
+        , svc_(&svc)
         , d_ptr_(device_ptr) {}
 
     // cudaMemcpyAsync always transfers the
@@ -424,20 +401,22 @@ public:
                         make_cuda_error(err);
                     return h;
                 }
-                self->cont_.h = h;
-                self->ctx_ = resume_ctx{
-                    env->executor,
-                    &self->cont_};
-                err = cudaLaunchHostFunc(
-                    self->stream_,
-                    &on_complete,
-                    &self->ctx_);
+                err = cudaEventRecord(
+                    self->event_,
+                    self->stream_);
                 if (err != cudaSuccess)
                 {
                     self->error_ =
                         make_cuda_error(err);
                     return h;
                 }
+                self->cont_.h = h;
+                self->svc_->register_wait(
+                    poll_entry{
+                        self->event_,
+                        env->executor,
+                        &self->cont_,
+                        &self->error_});
                 return std::noop_coroutine();
             }
 
@@ -482,7 +461,10 @@ task<> ingest(
 
 ```cpp
 // gpu_main.cpp - link against GPU transport
-cuda_device_stream gpu_sink(stream, d_ptr);
+poll_service       svc;
+cudaEvent_t        event = /* created */;
+cuda_device_stream gpu_sink(
+    stream, event, svc, d_ptr);
 any_write_stream dest(&gpu_sink);  // non-owning
 co_await ingest(dest, payload);    // -> GPU memory
 ```
@@ -649,9 +631,9 @@ The gap between networking ambition and deployed evidence suggests that data mov
 
 ## 14. Independent Validation
 
-Several independent projects have arrived at the same design: coroutine-based async completion for GPU and HPC data movement. The notification mechanism that bridges GPU completion to coroutine resumption varies - a host-function callback (`cudaLaunchHostFunc`, or its driver-level equivalent `cuLaunchHostFunc`), event polling, or deferred stream synchronization - but the coroutine completion model is common to all of them. The callback is the most frequently chosen bridge in the projects below because it is the simplest; it is not the only one in use.
+Several independent projects have arrived at the same design: coroutine-based async completion for GPU and HPC data movement. The notification mechanism that bridges GPU completion to coroutine resumption varies - event polling on a recorded `cudaEvent_t`, deferred stream synchronization, or a host-function callback (`cudaLaunchHostFunc` or its driver-level equivalent `cuLaunchHostFunc`) - but the coroutine completion model is common to all of them. Callbacks are the most frequently chosen bridge in the projects below because they are the simplest to wire up in isolation; production deployments (CERN traccc, per the CHEP 2026 measurement) increasingly select event polling as thread counts grow.
 
-**cuda-oxide (NVIDIA Labs, Rust).**<sup>[35]</sup> NVIDIA's own research lab implemented the same mechanism in Rust. Their `DeviceFuture` submits GPU work, enqueues a `cuLaunchHostFunc` callback that sets an `AtomicBool` and wakes a Tokio `Waker`, and the async runtime resumes the task on the next poll. Zero busy-wait. The three-state machine (Idle, Executing, Complete) is structurally identical to a network socket future. When NVIDIA's own research lab arrives at the same `cudaLaunchHostFunc`-to-async-runtime pattern independently, in a different language, the convergence is a data point about where the pattern fits naturally.
+**cuda-oxide (NVIDIA Labs, Rust).**<sup>[35]</sup> NVIDIA's own research lab implemented a coroutine-adjacent version of the pattern in Rust. Their `DeviceFuture` submits GPU work, enqueues a `cuLaunchHostFunc` callback that sets an `AtomicBool` and wakes a Tokio `Waker`, and the async runtime resumes the task on the next poll. Zero busy-wait. The three-state machine (Idle, Executing, Complete) is structurally identical to a network socket future. cuda-oxide chooses the callback bridge; the IoAwaitable protocol accepts any of the three mechanisms in Section 5. The relevant convergence is on the coroutine-based completion model itself.
 
 **CERN wp1.7-traccc.**<sup>[34]</sup> As part of its wp1.7 work package evaluating C++20 coroutines for task scheduling, CERN ported the traccc GPU track-reconstruction pipeline from stdexec to Capy. It implements its CUDA completion strategies behind a single `await_strategy` selector - among them a `cudaLaunchHostFunc` callback, event polling, and deferred `cudaStreamSynchronize` - each an awaitable with the signature `await_suspend(std::coroutine_handle<>, boost::capy::io_env const*)` that posts the coroutine handle back to `env->executor`. That a real reconstruction workload exercises all three notification mechanisms over one protocol is the most concrete evidence in this survey that the coroutine model is not bound to the callback.
 
@@ -667,7 +649,7 @@ Several independent projects have arrived at the same design: coroutine-based as
 
 These projects span GPU compute, molecular dynamics, high-energy physics, RDMA networking, and distributed systems. They were built by independent teams with no coordination. The convergence on coroutine-based async completion for data movement is a data point about where the pattern fits naturally. Several of these projects (Taro, TTG/PaRSEC, Desmond) also demonstrate coroutine-based kernel dispatch and GPU pipeline orchestration in production, placing that evidence in the record without this paper needing to reproduce it.
 
-**Question for the reader:** Are we reading this landscape correctly? Are there significant projects using the `cudaLaunchHostFunc`-to-coroutine pattern that we have missed?
+**Question for the reader:** Are we reading this landscape correctly? Are there significant projects using the coroutine-based GPU completion pattern - by callback, event polling, or deferred synchronization - that we have missed?
 
 ## 15. CUDA Graphs
 
@@ -840,15 +822,15 @@ The preceding sections present convergent findings. This section addresses fores
 
 **The sender-based networking survey may be incomplete.** The survey (Section 13) is as comprehensive as the authors could make it. If production-grade sender-based networking or data-movement implementations exist that the survey has missed, their evidence would strengthen the case for sender-based I/O. The paper will be updated with any additions.
 
-**The CUDA examples were generated with AI assistance.** Disclosed in Section 1. The examples are presented as a research exercise for evaluation by domain experts. Corrections are invited. Errors in the CUDA code would indicate where the examples need refinement; they would not invalidate the structural observation that five independent projects (Section 14) converged on the same `cudaLaunchHostFunc`-to-coroutine pattern without coordination.
+**The CUDA examples were generated with AI assistance.** Disclosed in Section 1. The examples are presented as a research exercise for evaluation by domain experts. Corrections are invited. Errors in the CUDA code would indicate where the examples need refinement; they would not invalidate the structural observation that five independent projects (Section 14) converged on the same coroutine-based GPU completion pattern without coordination.
 
 **The paper's P2300R10 quotations may be taken out of context.** All quotations include section numbers. Readers can verify context at the cited locations in P2300R10.<sup>[3]</sup> Corrections are welcome if any quotation misrepresents the original intent.
 
 ## 19. Conclusion
 
-A protocol handler compiled once links against TCP, RDMA, or GPU device memory without recompilation. This is possible because byte-oriented data movement - host-device memcpy, inter-GPU collectives over NVLink, RDMA transfers between nodes, and TCP sockets - shares a common async completion model that the IoAwaitable protocol captures with zero per-operation allocation. The CUDA Programming Guide confirms that single-stream callbacks are strictly serialized,<sup>[6]</sup> enabling the same pre-allocated op-state pattern that networking sockets use. Independent projects at NVIDIA Research (cuda-oxide),<sup>[35]</sup> CERN,<sup>[34]</sup> the University of Wisconsin-Madison (Taro),<sup>[36]</sup> and Schr&ouml;dinger (Desmond)<sup>[38]</sup> have converged on coroutine-based completion for data movement without coordination. The notification mechanism is a free variable the protocol does not fix: CERN's traccc port<sup>[34]</sup> implements the callback, event polling, and deferred synchronization as interchangeable awaitables, and a CHEP 2026 measurement<sup>[55]</sup> finds the callback the worst-scaling of the three under many worker threads.
+A protocol handler compiled once links against TCP, RDMA, or GPU device memory without recompilation. This is possible because byte-oriented data movement - host-device memcpy, inter-GPU collectives over NVLink, RDMA transfers between nodes, and TCP sockets - shares a common async completion model that the IoAwaitable protocol captures with zero per-operation allocation. The CUDA Programming Guide confirms that operations within a stream execute in enqueue order,<sup>[6]</sup> so a recorded event fires only after the preceding memcpy or kernel completes; the coroutine suspends until then, enabling the same pre-allocated op-state pattern that networking sockets use. Independent projects at NVIDIA Research (cuda-oxide),<sup>[35]</sup> CERN,<sup>[34]</sup> the University of Wisconsin-Madison (Taro),<sup>[36]</sup> and Schr&ouml;dinger (Desmond)<sup>[38]</sup> have converged on coroutine-based completion for data movement without coordination. The notification mechanism is a free variable the protocol does not fix: CERN's traccc port<sup>[34]</sup> implements event polling, deferred synchronization, and `cudaLaunchHostFunc` as interchangeable awaitables, and a CHEP 2026 measurement<sup>[55]</sup> finds event polling and deferred synchronization stable where the callback degrades under many worker threads.
 
-`cudaLaunchHostFunc` has documented limitations (Section 7) that bound the applicability of the callback mechanism in high-throughput GPU pipelines. Those limitations are specific to the callback: the protocol equally admits event polling and deferred synchronization, which sidestep them where they bite.
+The paper's running example uses event polling. `cudaLaunchHostFunc` remains a legitimate choice for low-concurrency deployments where its documented constraints (Section 7) do not bite, but it does not scale as worker-thread counts grow, and the reactor-shaped polling awaitable is the closer structural analogue to the networking case the paper argues from.
 
 `std::execution` provides real properties for GPU dispatch: zero-allocation compile-time composition, scheduler-agnostic portability, domain customization via `transform_sender`, and structured concurrency for dynamic fan-out. These properties stand without qualification. CUDA Graphs and sender fusion optimize at different layers - graphs reduce driver-level dispatch overhead, sender fusion reduces host-side C++ abstraction overhead - and they are complementary.
 
